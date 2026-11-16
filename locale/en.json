@@ -1,0 +1,11 @@
+{
+  "meta": {
+    "title": "Tu Bubbles",
+    "description": "LAN chat over WebRTC with messages stored in a local SQLite database.",
+    "detail": "Open Tu Bubbles from the sidebar, create a room and share the invite string with another machine on the same LAN. Chat messages travel peer-to-peer; the host only relays signaling."
+  },
+  "panel": {
+    "title": "Tu Bubbles",
+    "tab": "Chat"
+  }
+}

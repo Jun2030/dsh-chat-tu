@@ -1,0 +1,42 @@
+{
+  "name": "dsh-tu-bubbles",
+  "version": "0.1.0",
+  "private": true,
+  "description": "吐泡泡：本地优先的局域网 WebRTC 聊天插件（频道 / 表情 / 本地 SQLite）",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "host/",
+    "locale/",
+    "icon.svg",
+    "cordis.patch.yml",
+    "README.md",
+    "docs/"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node test/store.test.mjs && node test/signaling.test.mjs && node test/election.test.mjs && node test/client.test.mjs && node test/registration.test.mjs"
+  }
+}

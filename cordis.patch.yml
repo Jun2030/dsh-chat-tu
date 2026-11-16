@@ -1,0 +1,6 @@
+# 吐泡泡（dsh-tu-bubbles）bundle patch
+# 由 profile 装载器在 @deepseek-ai/dsh-base 之后应用：插入本插件的 host 条目。
+- insert:
+    - id: tu-bubbles
+      name: dsh-tu-bubbles
+      config: {}
