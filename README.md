@@ -147,8 +147,9 @@ pwsh -File scripts/install.ps1
 卸载：
 
 ```powershell
-pwsh -File scripts/uninstall.ps1              # 连本地数据库一起删
-pwsh -File scripts/uninstall.ps1 -KeepData    # 保留聊天记录
+pwsh -File scripts/uninstall.ps1              # 默认只移除插件，保留聊天记录
+pwsh -File scripts/uninstall.ps1 -RemoveData  # 明确删除默认 dataDir
+pwsh -File scripts/uninstall.ps1 -DataDir D:\data\tu-bubbles -RemoveData
 ```
 
 ## 4. 使用
@@ -270,8 +271,9 @@ dsh plugin --profile web remove dsh-tu-bubbles
 | 无消息推送 | 跨进程没有事件总线 | 房间内 500 ms 轮询（不在房间不轮询） |
 | 成员列表不含未连过的人 | 没有账号目录服务 | `peers` 表记录「见过的人」 |
 | 同一账号多端 | 允许，memberId 带设备后缀区分 | 若需互斥，可在 `room/join` 里加踢人策略 |
+| 频道归档 | 仅隐藏当前设备上的本地频道，保留历史消息 | 若要房间级归档，需要先定义共享目录与权限 |
 | 一个宿主只能一间房 | 信令中继是宿主内的单例 `SignalingHub` | 同机互聊请起第二个宿主（`dsh web --port`），并配独立 `dataDir` |
-| 同机多进程共用 `chat.db` | 同一个 DSH home → 同一路径 | 给每个进程配独立 `dataDir`；落库失败时会降级显示（不静默丢消息） |
+| 同机多进程共用 `chat.db` | 同一个 DSH home → 同一路径 | 给每个进程配独立 `dataDir`；落库失败时不 ACK，发送端可重试 |
 | 表情 ≤ 256 KB | 走 DataChannel + SQLite BLOB | 超限拒绝并提示 |
 | 同账号互发看不出「对方发的」 | 消息归属按 `senderId`（账号 id）+ `direction` 判定，同账号两端的消息气泡样式一致 | 两端用不同 DSH 账号即可正常区分左右 |
 

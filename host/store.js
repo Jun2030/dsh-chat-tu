@@ -121,7 +121,7 @@ export class Store {
     this.db
       .prepare(
         'INSERT INTO channels (id, name, created_by, created_at, archived, sort) VALUES (?, ?, ?, ?, 0, ?) ' +
-          'ON CONFLICT(id) DO NOTHING',
+          'ON CONFLICT(id) DO UPDATE SET name = excluded.name WHERE channels.archived = 0',
       )
       .run(id, name, createdBy, ts, ts)
     return this.getChannel(id)
@@ -201,25 +201,42 @@ export class Store {
 
   /** 最近消息（升序返回，方便直接渲染）。 */
   listMessages(channelId, { limit = 200, before = null } = {}) {
-    const rows = before === null
+    const cursor = before && typeof before === 'object'
+      ? { sentAt: Number(before.sentAt), id: typeof before.id === 'string' ? before.id : '' }
+      : null
+    const rows = before === null || before === undefined
       ? this.db
           .prepare(
             'SELECT id, channel_id AS channelId, sender_id AS senderId, sender_name AS senderName, kind, body, ' +
               'sent_at AS sentAt, direction, status, source FROM messages WHERE channel_id = ? ' +
-              'ORDER BY sent_at DESC, rowid DESC LIMIT ?',
+              'ORDER BY sent_at DESC, id DESC LIMIT ?',
           )
           .all(channelId, limit)
+      : cursor && Number.isFinite(cursor.sentAt) && cursor.id
+        ? this.db
+            .prepare(
+              'SELECT id, channel_id AS channelId, sender_id AS senderId, sender_name AS senderName, kind, body, ' +
+                'sent_at AS sentAt, direction, status, source FROM messages WHERE channel_id = ? ' +
+                'AND (sent_at < ? OR (sent_at = ? AND id < ?)) ' +
+                'ORDER BY sent_at DESC, id DESC LIMIT ?',
+            )
+            .all(channelId, cursor.sentAt, cursor.sentAt, cursor.id, limit)
       : this.db
           .prepare(
             'SELECT id, channel_id AS channelId, sender_id AS senderId, sender_name AS senderName, kind, body, ' +
               'sent_at AS sentAt, direction, status, source FROM messages WHERE channel_id = ? AND sent_at < ? ' +
-              'ORDER BY sent_at DESC, rowid DESC LIMIT ?',
+              'ORDER BY sent_at DESC, id DESC LIMIT ?',
           )
-          .all(channelId, before, limit)
+          .all(channelId, Number(before), limit)
     return rows.reverse()
   }
 
   updateMessageStatus(id, status) {
+    const current = this.getMessage(id)
+    if (!current) return null
+    // 状态只允许向前推进；failed 可经重试回到 sent，再到 delivered。
+    const rank = { sending: 0, failed: 1, sent: 2, delivered: 3 }
+    if ((rank[status] ?? -1) < (rank[current.status] ?? -1)) return current
     this.db.prepare('UPDATE messages SET status = ? WHERE id = ?').run(status, id)
     return this.getMessage(id)
   }

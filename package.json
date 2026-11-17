@@ -43,6 +43,6 @@
     }
   },
   "scripts": {
-    "test": "node test/store.test.mjs && node test/signaling.test.mjs && node test/election.test.mjs && node test/client.test.mjs && node test/registration.test.mjs"
+    "test": "node test/store.test.mjs && node test/signaling.test.mjs && node test/election.test.mjs && node test/client.test.mjs && node test/registration.test.mjs && node test/regression.test.mjs"
   }
 }

@@ -109,3 +109,25 @@ try {
     }
   }
 }
+
+// 已知最小候选离线时，下一候选应直接接管，不被离线地址阻塞。
+const offlineHost = makeHub()
+const offlineCandidate = makeHub()
+const offlineSuccessor = makeHub()
+try {
+  const room = await offlineHost.createRoom({ ...member('acct-offline-host', 'host'), port: 0 })
+  const invite = `127.0.0.1:${room.port}/${room.roomCode}`
+  await offlineCandidate.joinRoom({ invite, ...member('acct-offline-a', 'a') })
+  await offlineSuccessor.joinRoom({ invite, ...member('acct-offline-z', 'z') })
+  await waitFor(offlineHost, () => offlineHost.members.size === 3, '离线候选测试成员加入')
+  offlineCandidate.leave()
+  await waitFor(offlineSuccessor, () => offlineSuccessor.members.get('acct-offline-a:t')?.online === false, '继任者应看到候选离线')
+  offlineHost.leave()
+  const promoted = await waitFor(offlineSuccessor, (event) => event.kind === 'host-changed' && event.self === true, '离线候选后的继任者接管')
+  assert.equal(promoted.hostMemberId, 'acct-offline-z:t')
+  assert.equal(offlineSuccessor.role, 'host')
+} finally {
+  offlineHost.dispose()
+  offlineCandidate.dispose()
+  offlineSuccessor.dispose()
+}

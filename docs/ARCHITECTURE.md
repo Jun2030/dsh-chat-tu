@@ -136,7 +136,9 @@ ctx.inject(['connection', 'webServer'], (webContext) => {
 宿主没有把事件「推」给渲染层的能力（跨进程没有事件总线），所以客户端用 `tu-bubbles/sync` 拉：
 
 - 房间有效时 500 ms 一次，空闲 1500 ms 一次，不在房间完全不轮询；
-- 宿主侧 `SignalingHub#drain()` 返回并清空事件队列，天然支持多面板/多次轮询不重复。
+- 宿主侧 `SignalingHub#drain(consumerId)` 为每个渲染消费者维护游标；新房间轮询会重置消费者游标，避免旧房间事件污染。
+  队列最多保留 500 条，超出后按最旧事件淘汰。
+- 房间状态带 `epoch`；TCP 接入、RPC 操作和轮询结果都要匹配当前 epoch/operation，迟到结果直接丢弃。
 
 ## 4. 一次完整的聊天时序
 

@@ -117,8 +117,10 @@ CREATE INDEX idx_messages_status  ON messages (status);
 ## 3. 一句话总结数据流
 
 ```
-发送：UI → DataChannel(信封) → 本机 SQLite(status=sending) → status=sent → 对端 ack → status=delivered
+发送：UI → 本机 SQLite(status=sending) → DataChannel(信封) → status=sent → 对端落库 ack → status=delivered
 接收：DataChannel → channels/ensure（陌生频道）→ emojis/add（表情字节落地）→ messages/append(direction=in) → 回 ack
 ```
+
+频道归档只改变本地 `channels.archived`，不会广播给其他设备；消息历史仍保留。
 
 详见 `docs/ARCHITECTURE.md`。

@@ -300,11 +300,17 @@ try {
     5000,
     'B 同步到新频道',
   )
+  await hostA.controller.renameChannel(created.id, '摸鱼改名')
+  await waitFor(
+    () => hostB.controller.state.channels.some((c) => c.id === created.id && c.name === '摸鱼改名'),
+    5000,
+    'B 同步到频道改名',
+  )
   // 切到新频道发消息，验证频道归属
   await hostA.controller.selectChannel(created.id)
   await hostA.controller.sendText('频道隔离测试')
   await waitFor(
-    () => hostB.controller.state.channels.find((c) => c.name === '摸鱼') && hostB.store.listMessages(created.id).length === 1,
+    () => hostB.controller.state.channels.find((c) => c.name === '摸鱼改名') && hostB.store.listMessages(created.id).length === 1,
     5000,
     'B 在「摸鱼」频道收到消息',
   )
@@ -355,6 +361,12 @@ try {
     5000,
     'B 看到对方新昵称',
   )
+  // 轮询拿到旧成员快照时，已收到的远端昵称不能回退。
+  hostB.controller.applyRoom({
+    ...hostB.controller.state.room,
+    members: hostB.controller.state.room.members.map((member) => (member.accountId === 'acct-a' ? { ...member, name: 'A' } : member)),
+  })
+  assert.equal(hostB.controller.state.members.find((m) => m.accountId === 'acct-a')?.name, '小明')
   assert.equal(hostA.store.getProfile('acct-a').nickname, '小明')
 
   /* ---------------------------------------------------------- 重启后仍可读 */

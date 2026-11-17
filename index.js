@@ -7,7 +7,8 @@
  *   2. 起局域网 TCP 信令中继（房主时才真正监听端口）；
  *   3. 在 connection 服务的独立通道 /tu-bubbles 上挂 RPC 路由，供渲染层调用。
  *
- * 渲染层（client.js）负责 UI 与 WebRTC；聊天内容不经过这里。
+ * 渲染层（client.js）负责 UI 与 WebRTC；聊天内容不经信令中继转发，
+ * 本地持久化仍通过这里的 RPC 写入 host 侧 SQLite。
  */
 import { homedir } from 'node:os'
 import { join } from 'node:path'

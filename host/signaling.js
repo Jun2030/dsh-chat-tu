@@ -38,6 +38,8 @@ const ELECTION_ROUNDS = 3
 /** 断线后先原地重连房主：次数与间隔（总计约 3 秒）。 */
 const RECONNECT_ATTEMPTS = 3
 const RECONNECT_DELAY_MS = 1000
+/** 连接建立后等待 welcome 的最长时间，避免静默 socket 永久挂起。 */
+const HANDSHAKE_TIMEOUT_MS = 3000
 
 /** 生成人类可读的加入码，去掉容易混淆的 0/O/1/I。 */
 export function makeRoomCode(length = 6) {
@@ -98,6 +100,9 @@ function attachLineReader(socket, onMessage, onClose) {
 
 export class SignalingHub {
   #queue = []
+  #nextEventSeq = 1
+  #consumerCursors = new Map()
+  #roomEpoch = 0
   #standby = null
   #standbyPromise = null
   #sockets = new Map() // host 视角：memberId → socket
@@ -105,6 +110,7 @@ export class SignalingHub {
   #reconnectTimer = null
   #electionTimer = null
   #closed = false
+  #operationSeq = 0
   #leaving = false
   #electing = false
   #reconnecting = false
@@ -126,18 +132,36 @@ export class SignalingHub {
     this.lastError = null
   }
 
+  #operationActive(sequence) {
+    return sequence === this.#operationSeq && !this.#closed && !this.#leaving
+  }
+
   /* ------------------------------------------------------------ 事件队列 */
 
   #push(event) {
-    this.#queue.push(event)
+    this.#queue.push({ seq: this.#nextEventSeq++, epoch: this.#roomEpoch, event })
     if (this.#queue.length > QUEUE_LIMIT) this.#queue.splice(0, this.#queue.length - QUEUE_LIMIT)
   }
 
-  /** 渲染层轮询一次，取走自上次以来的所有事件。 */
-  drain() {
-    if (this.#queue.length === 0) return []
-    const events = this.#queue
-    this.#queue = []
+  /** 渲染层轮询一次；带 consumerId 时各窗口按自己的游标读取事件。 */
+  drain(consumerId = null, { reset = false, epoch = null } = {}) {
+    if (!consumerId) {
+      const events = this.#queue.map(({ event }) => event)
+      this.#queue = []
+      this.#consumerCursors.clear()
+      return events
+    }
+    const matchesEpoch = (entry) => epoch === null || entry.epoch === epoch
+    const firstSeq = this.#queue.find(matchesEpoch)?.seq ?? this.#nextEventSeq
+    if (reset) {
+      const cursor = epoch === null ? this.#nextEventSeq - 1 : firstSeq - 1
+      const events = this.#queue.filter((entry) => entry.seq > cursor && matchesEpoch(entry)).map(({ event }) => event)
+      this.#consumerCursors.set(consumerId, this.#nextEventSeq - 1)
+      return events
+    }
+    const cursor = this.#consumerCursors.get(consumerId) ?? firstSeq - 1
+    const events = this.#queue.filter((entry) => entry.seq > cursor && matchesEpoch(entry)).map(({ event }) => event)
+    this.#consumerCursors.set(consumerId, this.#nextEventSeq - 1)
     return events
   }
 
@@ -177,6 +201,7 @@ export class SignalingHub {
       hostAddress: this.hostAddress,
       self: this.self,
       members: this.#membersList(),
+      epoch: this.#roomEpoch,
       invites: hosting
         ? lanAddresses().map((a) => ({ address: a.address, iface: a.name, invite: `${a.address}:${this.port}/${this.roomCode}` }))
         : [],
@@ -218,8 +243,11 @@ export class SignalingHub {
   /** 创建房间：本机成为信令主机，复用 standby 端口。 */
   async createRoom({ memberId, accountId, name, port = 0 }) {
     if (this.role) this.leave()
+    const operation = ++this.#operationSeq
+    this.#roomEpoch += 1
     this.lastError = null
     await this.#ensureStandby()
+    if (!this.#operationActive(operation)) throw new Error('房间操作已取消')
     const code = makeRoomCode()
     this.role = 'host'
     this.roomCode = code
@@ -234,11 +262,18 @@ export class SignalingHub {
   }
 
   #acceptGuest(socket, code) {
+    const epoch = this.#roomEpoch
     let attempts = 0
     let memberId = null
+    let joined = false
+    const handshakeTimer = setTimeout(() => {
+      if (!joined) socket.destroy()
+    }, HANDSHAKE_TIMEOUT_MS)
     socket.on('close', () => {
+      clearTimeout(handshakeTimer)
       if (memberId && this.#sockets.get(memberId) === socket) {
         this.#sockets.delete(memberId)
+        if (this.role !== 'host' || this.roomCode !== code || this.#roomEpoch !== epoch) return
         const member = this.members.get(memberId)
         if (member) member.online = false
         this.#push({ kind: 'member-offline', memberId })
@@ -249,6 +284,10 @@ export class SignalingHub {
       socket,
       (message) => {
         if (message.t === 'join') {
+          if (this.role !== 'host' || this.roomCode !== code || this.#roomEpoch !== epoch) {
+            socket.destroy()
+            return
+          }
           attempts += 1
           if (attempts > JOIN_ATTEMPTS_PER_SOCKET) {
             socket.destroy()
@@ -259,6 +298,8 @@ export class SignalingHub {
             socket.destroy()
             return
           }
+          joined = true
+          clearTimeout(handshakeTimer)
           memberId = String(message.member.memberId)
           const previous = this.#sockets.get(memberId)
           if (previous && previous !== socket) previous.destroy()
@@ -320,14 +361,18 @@ export class SignalingHub {
       throw new Error('本机正在作为房主，不能同时加入房间：请让**另一台机器**加入，或先断开当前房间')
     }
     if (this.role) this.leave()
+    const operation = ++this.#operationSeq
+    this.#roomEpoch += 1
     this.lastError = null
     const parsed = parseInvite(invite)
     if (!parsed) throw new Error('邀请串格式应为 192.168.1.5:51820/ABC123')
     await this.#ensureStandby()
+    if (!this.#operationActive(operation)) throw new Error('房间操作已取消')
 
     this.#guestInvite = parsed
     this.#selfDraft = { memberId, accountId, name }
-    await this.#connectAsGuest(parsed, this.#selfDraft)
+    await this.#connectAsGuest(parsed, this.#selfDraft, () => this.#operationActive(operation))
+    if (!this.#operationActive(operation)) throw new Error('房间操作已取消')
     this.role = 'guest'
     this.roomCode = parsed.code
     this.hostAddress = `${parsed.host}:${parsed.port}`
@@ -336,13 +381,15 @@ export class SignalingHub {
     return this.status()
   }
 
-  #connectAsGuest(parsed, { memberId, accountId, name }) {
+  #connectAsGuest(parsed, { memberId, accountId, name }, isCurrent = () => !this.#closed && !this.#leaving) {
     return new Promise((resolve, reject) => {
       const socket = connect({ host: parsed.host, port: parsed.port })
       let settled = false
+      const timeout = setTimeout(() => fail(new Error('连接信令主机超时')), HANDSHAKE_TIMEOUT_MS)
       const fail = (error) => {
         if (settled) return
         settled = true
+        clearTimeout(timeout)
         socket.destroy()
         reject(error instanceof Error ? error : new Error(String(error)))
       }
@@ -361,12 +408,17 @@ export class SignalingHub {
         socket,
         (message) => {
           if (message.t === 'welcome') {
+            if (!isCurrent()) {
+              fail(new Error('房间操作已取消'))
+              return
+            }
             if (!settled) {
               settled = true
+              clearTimeout(timeout)
               resolve()
             }
             this.hostMemberId = message.self?.memberId ?? null
-            this.members = new Map((message.members ?? []).map((m) => [m.memberId, { ...m, online: true }]))
+            this.members = new Map((message.members ?? []).map((m) => [m.memberId, { ...m, online: m.online !== false }]))
             this.members.set(memberId, {
               memberId,
               accountId,
@@ -398,7 +450,7 @@ export class SignalingHub {
         },
         () => {
           if (settled) {
-            if (this.#leaving || this.#closed) return
+            if (!isCurrent()) return
             // 先当成「网络抖一下」：原地重连房主几次；实在连不上再进入选举。
             // 不这么做的话，一次瞬时断线就会让所有成员各自接管，出现两间「同码房」。
             this.#push({ kind: 'peer-left', message: '与信令主机的连接已断开，正在重连…' })
@@ -422,6 +474,7 @@ export class SignalingHub {
   async #reconnectOrElect() {
     if (this.#closed || this.#leaving || this.role !== 'guest' || this.#electing) return
     if (this.#reconnecting) return
+    const operation = this.#operationSeq
     this.#reconnecting = true
     try {
       const target = this.hostAddress ? parseInvite(`${this.hostAddress}/${this.roomCode}`) : null
@@ -430,16 +483,16 @@ export class SignalingHub {
         return
       }
       for (let attempt = 0; attempt < RECONNECT_ATTEMPTS; attempt += 1) {
-        if (this.#closed || this.#leaving || this.role !== 'guest') return
+        if (!this.#operationActive(operation) || this.role !== 'guest') return
         try {
-          await this.#connectAsGuest(target, this.#selfDraft)
+          await this.#connectAsGuest(target, this.#selfDraft, () => this.#operationActive(operation) && this.role === 'guest')
           this.#push({ kind: 'reconnected' })
           return
         } catch {
           if (attempt < RECONNECT_ATTEMPTS - 1) await new Promise((r) => setTimeout(r, RECONNECT_DELAY_MS))
         }
       }
-      if (this.#closed || this.#leaving || this.role !== 'guest') return
+      if (!this.#operationActive(operation) || this.role !== 'guest') return
       this.#push({ kind: 'peer-left', message: '房主已失联，正在选举新房主…' })
       this.#startElection(ELECTION_DELAY_MS)
     } finally {
@@ -453,29 +506,33 @@ export class SignalingHub {
    */
   #startElection(delay) {
     if (this.#closed || this.#leaving || this.#electing || this.role !== 'guest') return
+    const operation = this.#operationSeq
     this.#electing = true
     const run = async () => {
       this.#electionTimer = null
-      if (this.#closed || this.#leaving) {
+      if (!this.#operationActive(operation)) {
         this.#electing = false
         return
       }
       const hostId = this.hostMemberId
-      const candidates = [...this.members.values()]
-        .filter((m) => m.memberId !== hostId)
-        .sort((a, b) => (a.memberId < b.memberId ? -1 : 1))
-      const successor = candidates[0]
-      if (!successor || successor.memberId === this.self?.memberId) {
-        this.#promote()
-        return
-      }
       for (let round = 0; round < ELECTION_ROUNDS; round += 1) {
+        const candidates = [...this.members.values()]
+          .filter((m) => m.memberId !== hostId && m.online !== false)
+          .sort((a, b) => (a.memberId < b.memberId ? -1 : 1))
+        const successor = candidates[0]
+        if (!successor || successor.memberId === this.self?.memberId) {
+          this.#promote()
+          return
+        }
         for (const candidate of candidates) {
-          if (!candidate.address) continue
+          if (!candidate.address) {
+            candidate.online = false
+            continue
+          }
           const parsed = parseInvite(`${candidate.address}/${this.roomCode}`)
           if (!parsed) continue
           try {
-            await this.#connectAsGuest(parsed, this.#selfDraft)
+            await this.#connectAsGuest(parsed, this.#selfDraft, () => this.#operationActive(operation) && this.role === 'guest')
             this.hostMemberId = candidate.memberId
             this.hostAddress = candidate.address
             this.role = 'guest'
@@ -483,11 +540,11 @@ export class SignalingHub {
             this.#push({ kind: 'host-changed', self: false, hostMemberId: candidate.memberId, room: this.status() })
             return
           } catch {
-            /* 换下一个候选 */
+            candidate.online = false
           }
         }
         await new Promise((r) => setTimeout(r, 1200 * (round + 1)))
-        if (this.#closed || this.#leaving) {
+        if (!this.#operationActive(operation)) {
           this.#electing = false
           return
         }
@@ -554,6 +611,8 @@ export class SignalingHub {
   /* ------------------------------------------------------------ 生命周期 */
 
   leave() {
+    this.#operationSeq += 1
+    this.#roomEpoch += 1
     this.#leaving = true
     if (this.#electionTimer) {
       clearTimeout(this.#electionTimer)

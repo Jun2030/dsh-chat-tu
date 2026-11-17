@@ -7,7 +7,8 @@
  *   ctx.connection.rpc.call('/tu-bubbles', 'messages/list', { channelId }, signal)
  *   → { ok: true, value } | { ok: false, error: { code, message, details } }
  *
- * 这里只做三件事：读写 SQLite、管房间、转发信令。聊天内容本身不经过 host（走 WebRTC DataChannel）。
+ * 这里只做三件事：读写 SQLite、管房间、转发信令。聊天内容不经信令中继转发，
+ * 本地持久化仍由渲染层通过 RPC 交给 host。
  */
 import { DEFAULT_CHANNEL } from './store.js'
 
@@ -47,6 +48,7 @@ function memberIdFor(account, payload) {
   if (raw === undefined || raw === null || raw === '') return `${account.accountId}:local`
   const value = String(raw)
   if (!MEMBER_ID_PATTERN.test(value)) throw bad('memberId 非法')
+  if (!value.startsWith(`${account.accountId}:`)) throw bad('必须属于当前账号')
   return value
 }
 
@@ -138,9 +140,7 @@ export function createRouter({ store, hub, identity, logger }) {
         throw new RpcError('forbidden', '只有创建者可以归档该频道')
       }
       const archived = store.archiveChannel(id)
-      if (hub.role) {
-        hub.relay({ to: '*', payload: { kind: 'channel-archived', channel: archived } })
-      }
+      // 归档是本地隐藏语义，不广播远端，避免把各自历史库误当成共享目录。
       return archived
     },
 
@@ -149,7 +149,15 @@ export function createRouter({ store, hub, identity, logger }) {
     async 'messages/list'(payload) {
       const channelId = requireString(payload?.channelId, 'channelId', { max: 64 })
       const limit = Math.min(Math.max(Number(payload?.limit ?? 200) || 200, 1), 500)
-      const before = payload?.before === undefined || payload?.before === null ? null : Number(payload.before)
+      const rawBefore = payload?.before
+      const before = rawBefore === undefined || rawBefore === null
+        ? null
+        : rawBefore && typeof rawBefore === 'object'
+          ? { sentAt: Number(rawBefore.sentAt), id: rawBefore.id }
+          : Number(rawBefore)
+      if (before !== null && (!Number.isFinite(before) && !(before && Number.isFinite(before.sentAt) && typeof before.id === 'string' && before.id))) {
+        throw bad('before 游标非法')
+      }
       return { messages: store.listMessages(channelId, { limit, before }) }
     },
 
@@ -261,8 +269,10 @@ export function createRouter({ store, hub, identity, logger }) {
     },
 
     /** 长轮询替代：渲染层每 700ms 拉一次，取走队列里的事件。 */
-    async sync() {
-      return { events: hub.drain(), room: hub.status() }
+    async sync(payload) {
+      const consumerId = typeof payload?.consumerId === 'string' && payload.consumerId.length <= 96 ? payload.consumerId : 'default'
+      const room = hub.status()
+      return { events: hub.drain(consumerId, { reset: payload?.reset === true, epoch: room.epoch ?? null }), room }
     },
 
     /** 排障用：把本地库信息回给客户端，便于「设置 → 关于」里显示。 */

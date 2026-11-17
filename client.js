@@ -50,6 +50,38 @@ window.__ModuleLoader__.load({
       }
     }
 
+    function isRecord(value) {
+      return value !== null && typeof value === 'object' && !Array.isArray(value)
+    }
+
+    const MESSAGE_STATUS_ORDER = { sending: 0, failed: 1, sent: 2, delivered: 3 }
+
+    function statusRank(status) {
+      return MESSAGE_STATUS_ORDER[status] ?? -1
+    }
+
+    function isRenderableMessage(message) {
+      if (!isRecord(message)) return false
+      if (typeof message.id !== 'string' || message.id.length === 0 || message.id.length > 64) return false
+      if (typeof message.channelId !== 'string' || message.channelId.length === 0 || message.channelId.length > 64) return false
+      if (typeof message.senderId !== 'string' || message.senderId.length === 0 || message.senderId.length > 64) return false
+      if (typeof message.senderName !== 'string' || message.senderName.length === 0 || message.senderName.length > 64) return false
+      if (!['text', 'emoji'].includes(message.kind)) return false
+      const maxBody = message.kind === 'text' ? MAX_TEXT : MAX_EMOJI_BYTES
+      if (typeof message.body !== 'string' || message.body.length === 0 || message.body.length > maxBody) return false
+      return Number.isFinite(message.sentAt)
+    }
+
+    function validateIncomingEnvelope(envelope) {
+      if (!isRecord(envelope) || envelope.t !== 'msg' || !isRenderableMessage(envelope.message)) return null
+      const message = envelope.message
+      if (typeof message.channelName !== 'string' || message.channelName.trim().length === 0 || message.channelName.length > 32) return null
+      if (message.kind === 'emoji' && envelope.emoji !== undefined) {
+        if (!isRecord(envelope.emoji) || typeof envelope.emoji.name !== 'string' || typeof envelope.emoji.mime !== 'string' || typeof envelope.emoji.data !== 'string') return null
+      }
+      return message
+    }
+
     function formatTime(ts) {
       const date = new Date(ts)
       const hh = String(date.getHours()).padStart(2, '0')
@@ -150,7 +182,7 @@ window.__ModuleLoader__.load({
       }
 
       blank(memberId) {
-        return { memberId, pc: null, dc: null, state: 'connecting', attempts: 0, timer: null, remoteName: null }
+        return { memberId, pc: null, dc: null, state: 'connecting', attempts: 0, timer: null, remoteName: null, accountId: null }
       }
 
       emitPeer(memberId) {
@@ -162,13 +194,21 @@ window.__ModuleLoader__.load({
       sync(members) {
         if (this.disposed || !this.self) return
         const selfId = this.self.memberId
-        const wanted = new Set((members ?? []).map((m) => m.memberId).filter((id) => id && id !== selfId))
-        for (const id of wanted) {
-          if (!this.peers.has(id)) {
-            this.peers.set(id, this.blank(id))
-            this.emitPeer(id)
+        const wanted = new Map(
+          (members ?? [])
+            .filter((member) => isRecord(member) && member.memberId && member.memberId !== selfId && member.online !== false)
+            .map((member) => [member.memberId, member]),
+        )
+        for (const [id, member] of wanted) {
+          let entry = this.peers.get(id)
+          if (!entry) {
+            entry = this.blank(id)
+            this.peers.set(id, entry)
             if (selfId < id) this.offer(id)
           }
+          if (typeof member.accountId === 'string' && member.accountId) entry.accountId = member.accountId
+          if (typeof member.name === 'string' && member.name) entry.remoteName = member.name
+          this.emitPeer(id)
         }
         for (const id of [...this.peers.keys()]) {
           if (!wanted.has(id)) {
@@ -361,6 +401,9 @@ window.__ModuleLoader__.load({
           channels: [],
           activeChannelId: null,
           messages: [],
+          historyBefore: null,
+          historyHasMore: true,
+          loadingHistory: false,
           emojis: [],
           emojiData: {},
           room: null,
@@ -372,8 +415,12 @@ window.__ModuleLoader__.load({
         }
         this.listeners = new Set()
         this.emojiInflight = new Set()
+        this.remoteNames = new Map()
+        this.consumerId = uuid()
+        this.roomOperation = 0
         this.polling = false
         this.pollTimer = null
+        this.pollGeneration = 0
         this.toastTimer = null
         this.disposed = false
         this.mesh = new Mesh({
@@ -381,8 +428,9 @@ window.__ModuleLoader__.load({
           onPeerChange: (memberId, state, remoteName) => {
             const peerStates = { ...this.state.peerStates, [memberId]: state }
             this.emit({ peerStates })
-            if (remoteName) {
-              const members = this.state.members.map((m) => (m.memberId === memberId ? { ...m, name: remoteName } : m))
+            const preferredName = this.remoteNames.get(memberId) ?? remoteName
+            if (preferredName) {
+              const members = this.state.members.map((m) => (m.memberId === memberId ? { ...m, name: preferredName } : m))
               this.emit({ members })
             }
           },
@@ -425,6 +473,13 @@ window.__ModuleLoader__.load({
         return this.state.channels.find((c) => c.id === channelId)?.name ?? channelId
       }
 
+      connectionMember(fromMemberId) {
+        if (typeof fromMemberId !== 'string' || fromMemberId.length === 0) return null
+        const member = this.state.members.find((item) => item.memberId === fromMemberId)
+        if (!member || member.online === false || !this.mesh.peers.has(fromMemberId) || typeof member.accountId !== 'string' || member.accountId.length === 0) return null
+        return { memberId: fromMemberId, accountId: member.accountId, name: member.name ?? null }
+      }
+
       /* ------------------------------------------------------------- 初始化 */
 
       async init() {
@@ -464,21 +519,57 @@ window.__ModuleLoader__.load({
       async loadMessages(channelId) {
         if (!channelId) return
         try {
-          const { messages } = await this.call('messages/list', { channelId, limit: 200 })
-          if (channelId !== this.state.activeChannelId) return
-          this.emit({ messages })
+          const result = await this.call('messages/list', { channelId, limit: 200 })
+          if (channelId !== this.state.activeChannelId || !Array.isArray(result?.messages)) return
+          const messages = result.messages.filter((message) => message?.channelId === channelId && isRenderableMessage(message))
+          this.emit({
+            messages,
+            historyBefore: messages[0] ? { sentAt: messages[0].sentAt, id: messages[0].id } : null,
+            historyHasMore: messages.length >= 200,
+          })
         } catch (error) {
-          this.toast(`读取消息失败：${error.message}`)
+          if (channelId === this.state.activeChannelId) this.toast(`读取消息失败：${error.message}`)
         }
       }
 
-      async refreshChannels() {
+      async loadOlderMessages() {
+        const channelId = this.state.activeChannelId
+        const before = this.state.historyBefore
+        if (!channelId || !before || this.state.loadingHistory || !this.state.historyHasMore) return
+        this.emit({ loadingHistory: true })
+        try {
+          const result = await this.call('messages/list', { channelId, limit: 200, before })
+          if (channelId !== this.state.activeChannelId || !Array.isArray(result?.messages)) return
+          const older = result.messages.filter((message) => message?.channelId === channelId && isRenderableMessage(message))
+          if (older.length === 0) {
+            this.emit({ historyHasMore: false })
+            return
+          }
+          const seen = new Set(this.state.messages.map((message) => message.id))
+          const messages = [...older.filter((message) => !seen.has(message.id)), ...this.state.messages].sort((a, b) => a.sentAt - b.sentAt)
+          this.emit({
+            messages,
+            historyBefore: { sentAt: older[0].sentAt, id: older[0].id },
+            historyHasMore: older.length >= 200,
+          })
+        } catch (error) {
+          this.toast(`读取更早消息失败：${error.message}`)
+        } finally {
+          if (channelId === this.state.activeChannelId) this.emit({ loadingHistory: false })
+        }
+      }
+
+
+      async refreshChannels(generation = null) {
+        const current = () => generation === null || (this.polling && !this.disposed && generation === this.pollGeneration)
+        const requestedActiveChannelId = this.state.activeChannelId
         const { channels } = await this.call('channels/list')
+        if (!current() || requestedActiveChannelId !== this.state.activeChannelId) return
         const activeChannelId = channels.some((c) => c.id === this.state.activeChannelId)
           ? this.state.activeChannelId
           : (channels[0]?.id ?? null)
         this.emit({ channels, activeChannelId })
-        if (activeChannelId !== this.state.activeChannelId) await this.loadMessages(activeChannelId)
+        if (activeChannelId !== requestedActiveChannelId) await this.loadMessages(activeChannelId)
       }
 
       async refreshEmojis() {
@@ -490,7 +581,8 @@ window.__ModuleLoader__.load({
 
       async selectChannel(channelId) {
         if (channelId === this.state.activeChannelId) return
-        this.emit({ activeChannelId: channelId, messages: [] })
+        if (!this.state.channels.some((channel) => channel.id === channelId)) return
+        this.emit({ activeChannelId: channelId, messages: [], historyBefore: null, historyHasMore: true, loadingHistory: false })
         await this.loadMessages(channelId)
       }
 
@@ -498,8 +590,10 @@ window.__ModuleLoader__.load({
         const trimmed = String(name ?? '').trim()
         if (!trimmed) return this.toast('频道名不能为空')
         try {
+          const activeBefore = this.state.activeChannelId
           const channel = await this.call('channels/create', { name: trimmed })
           await this.refreshChannels()
+          if (this.state.activeChannelId !== activeBefore) return
           this.emit({ activeChannelId: channel.id, messages: [] })
           await this.loadMessages(channel.id)
           this.mesh.broadcast({ t: 'channels', channels: [{ id: channel.id, name: channel.name, createdBy: channel.createdBy }] })
@@ -524,7 +618,6 @@ window.__ModuleLoader__.load({
         try {
           await this.call('channels/archive', { id: channelId })
           await this.refreshChannels()
-          this.mesh.broadcast({ t: 'channels', channels: [] })
         } catch (error) {
           this.toast(error.message)
         }
@@ -549,6 +642,7 @@ window.__ModuleLoader__.load({
       /* --------------------------------------------------------------- 消息 */
 
       appendMessage(message) {
+        if (message?.channelId !== this.state.activeChannelId || !isRenderableMessage(message)) return
         const existing = this.state.messages.some((m) => m.id === message.id)
         if (existing) return this.patchMessage(message)
         const messages = [...this.state.messages, message].sort((a, b) => a.sentAt - b.sentAt)
@@ -556,17 +650,26 @@ window.__ModuleLoader__.load({
       }
 
       patchMessage(message) {
-        if (!message) return
-        const messages = this.state.messages.map((m) => (m.id === message.id ? message : m))
+        if (!message || message.channelId !== this.state.activeChannelId || !isRenderableMessage(message)) return
+        const messages = this.state.messages.map((current) => {
+          if (current.id !== message.id) return current
+          return statusRank(message.status) < statusRank(current.status) ? { ...message, status: current.status } : message
+        })
         this.emit({ messages })
       }
 
       async sendText(text) {
         const body = String(text ?? '').trim()
-        if (!body) return
-        if (body.length > MAX_TEXT) return this.toast(`消息不能超过 ${MAX_TEXT} 字`)
+        if (!body) return false
+        if (body.length > MAX_TEXT) {
+          this.toast(`消息不能超过 ${MAX_TEXT} 字`)
+          return false
+        }
         const channel = this.activeChannel()
-        if (!channel) return this.toast('请先选择频道')
+        if (!channel) {
+          this.toast('请先选择频道')
+          return false
+        }
         const message = {
           id: uuid(),
           channelId: channel.id,
@@ -577,12 +680,15 @@ window.__ModuleLoader__.load({
           body,
           sentAt: Date.now(),
         }
-        await this.dispatch(message, null)
+        return this.dispatch(message, null)
       }
 
       async sendEmoji(item) {
         const channel = this.activeChannel()
-        if (!channel) return this.toast('请先选择频道')
+        if (!channel) {
+          this.toast('请先选择频道')
+          return false
+        }
         const base = {
           id: uuid(),
           channelId: channel.id,
@@ -592,16 +698,14 @@ window.__ModuleLoader__.load({
           kind: 'emoji',
           sentAt: Date.now(),
         }
-        if (item.unicode) {
-          await this.dispatch({ ...base, body: JSON.stringify({ unicode: item.unicode }) }, null)
-          return
-        }
+        if (item.unicode) return this.dispatch({ ...base, body: JSON.stringify({ unicode: item.unicode }) }, null)
         try {
           const emoji = await this.call('emojis/get', { id: item.id })
           const body = JSON.stringify({ emojiId: emoji.id, name: emoji.name })
-          await this.dispatch({ ...base, body }, { name: emoji.name, mime: emoji.mime, data: emoji.data })
+          return this.dispatch({ ...base, body }, { name: emoji.name, mime: emoji.mime, data: emoji.data })
         } catch (error) {
           this.toast(`发送表情失败：${error.message}`)
+          return false
         }
       }
 
@@ -613,14 +717,18 @@ window.__ModuleLoader__.load({
           })
         } catch (error) {
           this.toast(`保存消息失败：${error.message}`)
-          return
+          return false
+        }
+        if (!stored || !isRenderableMessage(stored.message)) {
+          this.toast('保存消息失败：宿主返回了无效消息')
+          return false
         }
         this.appendMessage(stored.message)
         if (this.mesh.onlineCount() === 0) {
           const failed = await this.call('messages/status', { id: message.id, status: 'failed' }).catch(() => null)
           if (failed) this.patchMessage(failed)
           this.toast('当前没有在线成员，消息只保存在本地')
-          return
+          return true
         }
         const envelope = { t: 'msg', message }
         if (emojiPayload) envelope.emoji = emojiPayload
@@ -628,6 +736,7 @@ window.__ModuleLoader__.load({
         const status = sent > 0 ? 'sent' : 'failed'
         const updated = await this.call('messages/status', { id: message.id, status }).catch(() => null)
         if (updated) this.patchMessage(updated)
+        return true
       }
 
       async retryMessage(message) {
@@ -660,46 +769,49 @@ window.__ModuleLoader__.load({
 
       /** 收到对端 DataChannel 数据。 */
       async handleIncoming(data, fromMemberId) {
-        if (this.disposed || !data) return
+        if (this.disposed || !isRecord(data)) return false
         if (data.t === 'hello') {
-          const entry = this.mesh.peers.get(fromMemberId)
-          if (entry) entry.remoteName = data.name ?? null
+          const member = this.connectionMember(fromMemberId)
+          if (!member || (data.memberId !== undefined && data.memberId !== fromMemberId) || (data.accountId !== undefined && data.accountId !== member.accountId)) return false
           this.sendChannelsTo(fromMemberId)
-          return
+          return true
         }
         if (data.t === 'channels') {
+          if (!this.connectionMember(fromMemberId) || !Array.isArray(data.channels)) return false
           let changed = false
-          for (const channel of data.channels ?? []) {
-            if (!channel?.id) continue
+          for (const channel of data.channels) {
+            if (!isRecord(channel) || typeof channel.id !== 'string' || channel.id.length === 0 || typeof channel.name !== 'string' || channel.name.length === 0) continue
             try {
-              await this.call('channels/ensure', {
+              const ensured = await this.call('channels/ensure', {
                 id: channel.id,
-                name: channel.name ?? '未命名频道',
+                name: channel.name,
                 createdBy: channel.createdBy ?? null,
               })
-              changed = true
+              if (ensured?.id === channel.id) changed = true
             } catch {
-              /* 单个频道失败不阻塞 */
+              /* keep processing the remaining channels */
             }
           }
           if (changed) await this.refreshChannels()
-          return
+          return true
         }
         if (data.t === 'ack') {
+          if (!this.connectionMember(fromMemberId) || typeof data.id !== 'string' || data.id.length === 0 || data.id.length > 64) return false
           const updated = await this.call('messages/status', { id: data.id, status: 'delivered' }).catch(() => null)
-          if (updated) this.patchMessage(updated)
-          return
+          if (updated && isRenderableMessage(updated)) this.patchMessage(updated)
+          return Boolean(updated)
         }
         if (data.t === 'nickname') {
+          if (typeof data.name !== 'string' || data.name.length === 0 || !this.connectionMember(fromMemberId)) return false
+          this.remoteNames.set(fromMemberId, data.name)
           const entry = this.mesh.peers.get(fromMemberId)
-          if (entry) entry.remoteName = data.name ?? null
-          const members = this.state.members.map((m) => (m.memberId === fromMemberId ? { ...m, name: data.name ?? m.name } : m))
+          if (entry) entry.remoteName = data.name
+          const members = this.state.members.map((m) => (m.memberId === fromMemberId ? { ...m, name: data.name } : m))
           this.emit({ members })
-          return
+          return true
         }
-        if (data.t === 'msg') {
-          await this.receiveMessage(data, fromMemberId)
-        }
+        if (data.t === 'msg') return this.receiveMessage(data, fromMemberId)
+        return false
       }
 
       sendChannelsTo(memberId) {
@@ -708,40 +820,43 @@ window.__ModuleLoader__.load({
       }
 
       async receiveMessage(envelope, fromMemberId) {
-        const message = envelope.message
-        if (!message || typeof message.id !== 'string') return
+        const message = validateIncomingEnvelope(envelope)
+        const member = this.connectionMember(fromMemberId)
+        if (!message || !member || message.senderId !== member.accountId) return false
         try {
-          await this.call('channels/ensure', {
+          const channel = await this.call('channels/ensure', {
             id: message.channelId,
-            name: message.channelName ?? '未命名频道',
-            createdBy: message.senderId ?? null,
+            name: message.channelName,
+            createdBy: member.accountId,
           })
-          // 表情消息：把对端的表情字节落到本地库（id 是内容哈希，天然去重）。
+          if (!channel || channel.id !== message.channelId) throw new Error('频道同步失败')
           if (message.kind === 'emoji' && envelope.emoji?.data) {
             try {
               await this.call('emojis/add', envelope.emoji)
               await this.refreshEmojis()
             } catch {
-              /* 重复或超限都忽略，消息仍可显示占位 */
+              /* duplicate or invalid emoji payload does not invalidate the message */
             }
           }
           const stored = await this.call('messages/append', {
             message: { ...message, direction: 'in', status: 'delivered' },
           })
-          this.mesh.sendTo(fromMemberId, { t: 'ack', id: message.id })
-          if (stored.inserted && message.channelId === this.state.activeChannelId) {
-            this.appendMessage(stored.message)
-          } else if (stored.inserted) {
-            await this.refreshChannels()
+          if (!stored || typeof stored.inserted !== 'boolean' || !isRenderableMessage(stored.message) || stored.message.channelId !== message.channelId) {
+            throw new Error('宿主返回了无效消息')
           }
+          if (!stored.inserted && (stored.message.senderId !== message.senderId || stored.message.kind !== message.kind || stored.message.body !== message.body || stored.message.sentAt !== message.sentAt)) {
+            throw new Error('消息 ID 与已保存内容冲突')
+          }
+          this.mesh.sendTo(fromMemberId, { t: 'ack', id: message.id })
+          if (stored.inserted) {
+            if (message.channelId === this.state.activeChannelId) this.appendMessage(stored.message)
+            else await this.refreshChannels().catch(() => {})
+          }
+          return true
         } catch (error) {
           console.warn('[tu-bubbles] 落库失败', error)
-          // 落库失败（例如另一个 DSH 进程正在写同一个库）不能静默丢消息：
-          // 先在内存里显示出来并回执，再提示用户这条没有持久化。
-          const displayed = { ...message, direction: 'in', status: 'delivered' }
-          if (message.channelId === this.state.activeChannelId) this.appendMessage(displayed)
-          this.mesh.sendTo(fromMemberId, { t: 'ack', id: message.id })
-          this.toast('消息已显示，但写入本地数据库失败（可能有另一个 DSH 进程正在使用同一个库）')
+          this.toast('消息未保存，未发送送达确认')
+          return false
         }
       }
 
@@ -802,8 +917,12 @@ window.__ModuleLoader__.load({
           memberId: m.memberId,
           accountId: m.accountId ?? null,
           name: m.name ?? m.accountId ?? m.memberId,
+          online: m.online !== false,
           isSelf: m.memberId === selfId,
         }))
+        for (const member of members) {
+          if (!member.isSelf && this.remoteNames.has(member.memberId)) member.name = this.remoteNames.get(member.memberId)
+        }
         // 本地昵称覆盖房间里的旧名字（同一个 accountId 只保留最新昵称）。
         if (self) {
           const mine = members.find((m) => m.memberId === selfId)
@@ -815,8 +934,12 @@ window.__ModuleLoader__.load({
 
       async createRoom() {
         if (!this.state.identity?.signedIn) return this.toast('请先登录账号')
+        if (this.state.room?.role) await this.leaveRoom()
+        const operation = ++this.roomOperation
         try {
           const room = await this.call('room/create', { memberId: this.memberId() })
+          if (operation !== this.roomOperation || this.disposed) return
+          this.remoteNames.clear()
           this.applyRoom(room)
           this.startPolling()
           this.toast(room.invites?.length ? '房间已创建，把邀请串发给对方' : '房间已创建')
@@ -828,8 +951,12 @@ window.__ModuleLoader__.load({
       async joinRoom(invite) {
         const text = String(invite ?? '').trim()
         if (!text) return this.toast('请粘贴邀请串')
+        if (this.state.room?.role) await this.leaveRoom()
+        const operation = ++this.roomOperation
         try {
           const room = await this.call('room/join', { invite: text, memberId: this.memberId() })
+          if (operation !== this.roomOperation || this.disposed) return
+          this.remoteNames.clear()
           this.applyRoom(room)
           this.startPolling()
         } catch (error) {
@@ -838,7 +965,9 @@ window.__ModuleLoader__.load({
       }
 
       async leaveRoom() {
+        const operation = ++this.roomOperation
         this.stopPolling()
+        this.remoteNames.clear()
         this.mesh.dispose()
         this.mesh = new Mesh({
           call: this.call,
@@ -852,6 +981,7 @@ window.__ModuleLoader__.load({
         } catch {
           /* 忽略 */
         }
+        if (operation !== this.roomOperation || this.disposed) return
         this.emit({ room: null, members: [], peerStates: {} })
       }
 
@@ -860,17 +990,29 @@ window.__ModuleLoader__.load({
       startPolling() {
         if (this.polling) return
         this.polling = true
+        this.consumerId = uuid()
+        const generation = ++this.pollGeneration
+        let resetConsumer = true
         const tick = async () => {
-          if (!this.polling || this.disposed) return
+          if (!this.polling || this.disposed || generation !== this.pollGeneration) return
           try {
-            const { events, room } = await this.call('sync')
+            const { events, room } = await this.call('sync', {
+              consumerId: this.consumerId,
+              reset: resetConsumer,
+              epoch: this.state.room?.epoch ?? null,
+            })
+            resetConsumer = false
+            if (!this.polling || this.disposed || generation !== this.pollGeneration) return
             this.applyRoom(room)
-            for (const event of events ?? []) await this.handleEvent(event)
+            for (const event of events ?? []) {
+              if (!this.polling || this.disposed || generation !== this.pollGeneration) return
+              await this.handleEvent(event, generation)
+            }
           } catch (error) {
             // 单次失败不影响下一轮；记一条日志，避免「连不上」时完全无线索。
             console.warn('[tu-bubbles] 同步失败', error)
           }
-          if (!this.polling) return
+          if (!this.polling || this.disposed || generation !== this.pollGeneration) return
           const interval = this.state.room?.role ? POLL_ACTIVE_MS : POLL_IDLE_MS
           this.pollTimer = setTimeout(tick, interval)
         }
@@ -879,46 +1021,75 @@ window.__ModuleLoader__.load({
 
       stopPolling() {
         this.polling = false
+        this.pollGeneration += 1
         if (this.pollTimer) clearTimeout(this.pollTimer)
         this.pollTimer = null
       }
 
-      async handleEvent(event) {
+      async handleEvent(event, generation = null) {
         if (!event || typeof event !== 'object') return
+        const current = () => generation === null || (this.polling && !this.disposed && generation === this.pollGeneration)
+        if (!current()) return
         switch (event.kind) {
           case 'signal':
+            if (['channel-created', 'channel-renamed', 'channel-archived', 'nickname'].includes(event.payload?.kind)) {
+              await this.handleEvent(event.payload, generation)
+              break
+            }
             await this.mesh.handleSignal(event.from, event.payload)
+            if (!current()) return
             break
           case 'channel-created':
           case 'channel-renamed':
           case 'channel-archived':
-            await this.refreshChannels()
+            if (event.channel?.id && event.channel?.name && event.kind !== 'channel-archived') {
+              await this.call('channels/ensure', {
+                id: event.channel.id,
+                name: event.channel.name,
+                createdBy: event.channel.createdBy ?? null,
+              }).catch(() => null)
+            }
+            await this.refreshChannels(generation)
+            if (!current()) return
             break
           case 'nickname': {
             const members = this.state.members.map((m) =>
               m.accountId === event.accountId ? { ...m, name: event.name ?? m.name } : m,
             )
+            for (const member of members) {
+              if (member.accountId === event.accountId && event.name) this.remoteNames.set(member.memberId, event.name)
+            }
+            if (!current()) return
             this.emit({ members })
             break
           }
           case 'error':
+            if (!current()) return
             this.toast(event.message ?? '信令错误')
             break
           case 'host-changed': {
             // 房主走了：继任者已用同一个房间码接管（可能就是我们自己）。
             // 已建立的 DataChannel 是端到端的，不需要重建；这里只刷新房间与成员，
             // 让 Mesh 按新的成员表补连或断开。
-            this.applyRoom(event.room ?? (await this.call('room/status').catch(() => this.state.room)))
+            const room = event.room ?? (await this.call('room/status').catch(() => this.state.room))
+            if (!current()) return
+            this.applyRoom(room)
             this.toast(event.self ? '原房主已离开，本机已接管房间' : '房主已更换，已连上新房主')
             break
           }
           case 'reconnected':
             // 断线后原地重连上了原房主：成员表可能已经变化，刷新一下即可。
-            this.applyRoom(await this.call('room/status').catch(() => this.state.room))
+            {
+              const room = await this.call('room/status').catch(() => this.state.room)
+              if (current()) this.applyRoom(room)
+            }
             break
           case 'member-offline':
           case 'peer-left':
-            this.applyRoom(await this.call('room/status').catch(() => this.state.room))
+            {
+              const room = await this.call('room/status').catch(() => this.state.room)
+              if (current()) this.applyRoom(room)
+            }
             break
           default:
             // members / member-online / joined / room：房间状态已随 sync 更新
@@ -936,6 +1107,7 @@ window.__ModuleLoader__.load({
 
       dispose() {
         this.disposed = true
+        this.roomOperation += 1
         this.stopPolling()
         this.mesh.dispose()
         if (this.toastTimer) clearTimeout(this.toastTimer)
@@ -1035,7 +1207,7 @@ window.__ModuleLoader__.load({
           { className: 'tub-msg-meta' },
           h('span', null, formatTime(message.sentAt)),
           mine ? h('span', { className: `tub-status tub-status-${message.status}` }, STATUS_TEXT[message.status] ?? message.status) : null,
-          mine && message.status === 'failed'
+          mine && ['failed', 'sending'].includes(message.status)
             ? h('button', { className: 'tub-link', onClick: () => controller.retryMessage(message) }, '重试')
             : null,
         ),
@@ -1299,11 +1471,11 @@ window.__ModuleLoader__.load({
       const textareaRef = React.useRef(null)
       const channel = controller.activeChannel()
 
-      const send = () => {
+      const send = async () => {
         const value = text
         if (!value.trim()) return
-        setText('')
-        controller.sendText(value)
+        const saved = await controller.sendText(value)
+        if (saved) setText((current) => (current === value ? '' : current))
         textareaRef.current?.focus()
       }
 
@@ -1362,9 +1534,12 @@ window.__ModuleLoader__.load({
       const state = controller.state
       const channel = controller.activeChannel()
       const listRef = React.useRef(null)
+      const followTailRef = React.useRef(true)
+      const previousChannelRef = React.useRef(state.activeChannelId)
       React.useEffect(() => {
         const node = listRef.current
-        if (node) node.scrollTop = node.scrollHeight
+        if (node && (followTailRef.current || previousChannelRef.current !== state.activeChannelId)) node.scrollTop = node.scrollHeight
+        previousChannelRef.current = state.activeChannelId
       }, [state.messages.length, state.activeChannelId])
 
       if (!channel) {
@@ -1381,13 +1556,31 @@ window.__ModuleLoader__.load({
           h(
             'div',
             { className: 'tub-chat-sub' },
-            state.members.filter((m) => !m.isSelf).length,
+            state.members.filter((m) => !m.isSelf && m.online !== false).length,
             ' 位在线成员 · 消息存本地 SQLite',
           ),
         ),
         h(
           'div',
-          { className: 'tub-messages', ref: listRef },
+          {
+            className: 'tub-messages',
+            ref: listRef,
+            onScroll: (event) => {
+              const node = event.currentTarget
+              followTailRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 80
+            },
+          },
+          state.historyBefore
+            ? h(
+                'button',
+                {
+                  className: 'tub-link tub-history-more',
+                  disabled: state.loadingHistory,
+                  onClick: () => controller.loadOlderMessages(),
+                },
+                state.loadingHistory ? '正在加载…' : state.historyHasMore ? '加载更早消息' : '没有更早消息',
+              )
+            : null,
           state.messages.length === 0
             ? h('div', { className: 'tub-empty tub-empty-center' }, '还没有消息，说点什么吧')
             : state.messages.map((message, index) => {
@@ -1712,6 +1905,8 @@ window.__ModuleLoader__.load({
 .tub-input{border:1px solid var(--dsw-alias-border-l1,#d9d9df);border-radius:6px;padding:4px 7px;font:inherit;font-size:12px;background:var(--dsw-alias-bg-layer-2,#2a2a2e);color:var(--dsw-alias-label-primary,#f2f2f5);outline:none;min-width:0;flex:1}
 .tub-input:focus{border-color:var(--dsw-alias-link,#3b6ef6)}
 .tub-link{border:none;background:transparent;color:var(--dsw-alias-link,#3b6ef6);cursor:pointer;font:inherit;font-size:11px;padding:0}
+.tub-history-more{align-self:center;padding:4px 8px;font-size:12px}
+.tub-history-more:disabled{cursor:default;opacity:.65}
 .tub-danger{color:#c33}
 .tub-hint{font-size:11px;line-height:1.5;color:var(--dsw-alias-label-secondary,#888)}
 .tub-empty{padding:14px;text-align:center;color:var(--dsw-alias-label-secondary,#999);font-size:12px}

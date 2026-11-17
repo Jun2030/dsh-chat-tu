@@ -44,6 +44,17 @@ const m2 = store.insertMessage({
 assert.equal(m2.inserted, false)
 assert.equal(store.countMessages(ch.id), 1)
 assert.equal(store.updateMessageStatus('m-fixed', 'delivered').status, 'delivered')
+assert.equal(store.updateMessageStatus('m-fixed', 'sent').status, 'delivered', '消息状态不得从 delivered 回退')
+
+// 同一毫秒的消息用复合游标分页，不得漏掉边界记录。
+const page = store.createChannel({ name: '分页', createdBy: 'acct-1' })
+for (const id of ['same-a', 'same-b', 'same-c']) {
+  store.insertMessage({ id, channelId: page.id, senderId: 'acct-1', senderName: '小明', kind: 'text', body: id, sentAt: 100, direction: 'out' })
+}
+const firstPage = store.listMessages(page.id, { limit: 2 })
+const secondPage = store.listMessages(page.id, { limit: 2, before: { sentAt: firstPage[0].sentAt, id: firstPage[0].id } })
+assert.deepEqual([...firstPage, ...secondPage].map((message) => message.id).sort(), ['same-a', 'same-b', 'same-c'])
+assert.equal(store.archiveChannel(page.id).archived, 1)
 
 // 昵称
 assert.equal(store.getProfile('acct-1'), null)
@@ -64,7 +75,7 @@ assert.equal(store.listEmojis().length, 0)
 // 归档后消息仍在
 assert.equal(store.archiveChannel(ch.id).archived, 1)
 assert.equal(store.listChannels().length, 1)
-assert.equal(store.listChannels(true).length, 2)
+assert.equal(store.listChannels(true).length, 3)
 assert.equal(store.countMessages(ch.id), 1)
 
 // 重启后仍可读取（持久化验证）
@@ -72,7 +83,7 @@ store.close()
 store = openStore(file)
 assert.equal(store.getProfile('acct-1').nickname, '泡泡侠2')
 assert.equal(store.countMessages(ch.id), 1)
-assert.equal(store.listChannels(true).length, 2)
+assert.equal(store.listChannels(true).length, 3)
 store.close()
 
 rmSync(dir, { recursive: true, force: true })

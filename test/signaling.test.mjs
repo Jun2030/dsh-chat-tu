@@ -4,6 +4,7 @@
  *   node test/signaling.test.mjs
  */
 import assert from 'node:assert/strict'
+import { connect, createServer } from 'node:net'
 import { SignalingHub, parseInvite } from '../host/signaling.js'
 
 const silent = { info() {}, warn() {}, error() {} }
@@ -20,6 +21,8 @@ assert.equal(hostStatus.role, 'host')
 assert.ok(hostStatus.port > 0)
 assert.ok(hostStatus.invites.length >= 1, '应至少有一个局域网邀请串')
 assert.match(hostStatus.invites[0].invite, /^\d+\.\d+\.\d+\.\d+:\d+\/[A-Z0-9]{6}$/)
+assert.equal(host.drain('window-a').some((event) => event.kind === 'room'), true, '第一个窗口应读到房间事件')
+assert.equal(host.drain('window-b').some((event) => event.kind === 'room'), true, '第二个窗口不应抢走房间事件')
 
 const invite = `127.0.0.1:${hostStatus.port}/${hostStatus.roomCode}`
 assert.deepEqual(parseInvite(invite), { host: '127.0.0.1', port: hostStatus.port, code: hostStatus.roomCode })
@@ -73,4 +76,82 @@ assert.ok(offline, '房主应收到成员离线事件')
 host.dispose()
 guest.dispose()
 guest2.dispose()
+
+// TCP 已连接但永不发送 welcome 时，应用握手必须有截止时间。
+const silentSockets = new Set()
+const silentServer = createServer((socket) => {
+  silentSockets.add(socket)
+  socket.once('close', () => silentSockets.delete(socket))
+})
+await new Promise((resolve) => silentServer.listen(0, '127.0.0.1', resolve))
+const silentPort = silentServer.address().port
+const timeoutGuest = new SignalingHub({ logger: silent })
+try {
+  const started = Date.now()
+  await assert.rejects(
+    () => timeoutGuest.joinRoom({ invite: `127.0.0.1:${silentPort}/${hostStatus.roomCode}`, memberId: 'acct-timeout:1', accountId: 'acct-timeout', name: 'timeout' }),
+    /超时|失败/,
+  )
+  assert.ok(Date.now() - started < 5000, '静默握手应在截止时间内结束')
+} finally {
+  timeoutGuest.dispose()
+  for (const socket of silentSockets) socket.destroy()
+  await new Promise((resolve) => silentServer.close(resolve))
+}
+
+// 并发房间操作只允许最后一次生效，旧操作不能迟到覆盖状态。
+const raceHub = new SignalingHub({ logger: silent })
+try {
+  const first = raceHub.createRoom({ memberId: 'acct-race:1', accountId: 'acct-race', name: 'first' })
+  const second = raceHub.createRoom({ memberId: 'acct-race:2', accountId: 'acct-race', name: 'second' })
+  await assert.rejects(first, /取消/)
+  const winner = await second
+  assert.equal(raceHub.roomCode, winner.roomCode)
+  raceHub.drain('room-session')
+  raceHub.drain('room-session', { reset: true })
+  const next = await raceHub.createRoom({ memberId: 'acct-race:3', accountId: 'acct-race', name: 'next' })
+  const events = raceHub.drain('room-session')
+  assert.ok(events.some((event) => event.kind === 'room' && event.state?.roomCode === next.roomCode), '新房间会话不应读取旧事件')
+  assert.equal(events.some((event) => event.kind === 'room' && event.state?.roomCode === winner.roomCode), false)
+} finally {
+  raceHub.dispose()
+}
+
+// reset 只隔离旧房间事件，不能丢掉当前会话已排队的信令。
+const resetHost = new SignalingHub({ logger: silent })
+const resetGuest = new SignalingHub({ logger: silent })
+try {
+  const room = await resetHost.createRoom({ memberId: 'acct-reset-host:1', accountId: 'acct-reset-host', name: 'host' })
+  await resetGuest.joinRoom({ invite: `127.0.0.1:${room.port}/${room.roomCode}`, memberId: 'acct-reset-guest:1', accountId: 'acct-reset-guest', name: 'guest' })
+  await tick()
+  const epoch = resetHost.status().epoch
+  resetHost.drain('reset-session', { reset: true, epoch })
+  resetGuest.relay({ to: 'acct-reset-host:1', payload: { kind: 'offer', sdp: 'queued-offer' } })
+  await tick()
+  const currentEvents = resetHost.drain('reset-session', { reset: true, epoch })
+  assert.ok(currentEvents.some((event) => event.kind === 'signal' && event.payload?.sdp === 'queued-offer'), 'reset 不得丢当前会话信令')
+  assert.equal(resetHost.drain('reset-session', { epoch }).some((event) => event.payload?.sdp === 'queued-offer'), false, 'reset 返回的事件不应重复消费')
+} finally {
+  resetHost.dispose()
+  resetGuest.dispose()
+}
+
+// 旧房间 socket 在 leave 后发送 join 时必须被拒绝，不能污染新成员表。
+const lateHost = new SignalingHub({ logger: silent })
+let lateSocket
+try {
+  const room = await lateHost.createRoom({ memberId: 'acct-late-host:1', accountId: 'acct-late-host', name: 'host' })
+  lateSocket = connect({ host: '127.0.0.1', port: room.port })
+  await new Promise((resolve, reject) => {
+    lateSocket.once('connect', resolve)
+    lateSocket.once('error', reject)
+  })
+  lateHost.leave()
+  lateSocket.write(`${JSON.stringify({ t: 'join', code: room.roomCode, member: { memberId: 'late:t', accountId: 'late', name: 'late' } })}\n`)
+  await tick()
+  assert.equal(lateHost.members.size, 0, '旧 socket 不得在离房后写入成员')
+} finally {
+  lateSocket?.destroy()
+  lateHost.dispose()
+}
 console.log('✓ signaling.test.mjs 全部通过')
